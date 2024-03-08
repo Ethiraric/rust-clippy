@@ -1,8 +1,11 @@
+use std::ops::ControlFlow::{Break, Continue};
+
 use clippy_utils::diagnostics::{multispan_sugg, span_lint_and_then};
 use clippy_utils::paths::{CORE_ITER_ENUMERATE_METHOD, CORE_ITER_ENUMERATE_STRUCT};
 use clippy_utils::source::snippet;
-use clippy_utils::{expr_or_init, is_trait_method, match_def_path, pat_is_wild};
-use rustc_hir::{Expr, ExprKind, PatKind};
+use clippy_utils::visitors::{for_each_expr_with_closures, Descend};
+use clippy_utils::{expr_or_init, is_trait_method, match_def_path, pat_is_wild, path_to_local_id};
+use rustc_hir::{Body, Expr, ExprKind, Param, PatKind};
 use rustc_lint::LateContext;
 use rustc_middle::ty::AdtDef;
 use rustc_span::{sym, Span};
@@ -47,19 +50,16 @@ pub(super) fn check(cx: &LateContext<'_>, call_expr: &Expr<'_>, recv: &Expr<'_>,
         // And the map argument is a closure
         && let ExprKind::Closure(closure) = closure_arg.kind
         && let closure_body = cx.tcx.hir().body(closure.body)
-        // And that closure has one argument ...
+        // And that closure has one argument
         && let [closure_param] = closure_body.params
-        // .. which is a tuple of 2 elements
-        && let PatKind::Tuple([index, elem], ..) = closure_param.pat.kind
-        // And that the first element (the index) is either `_` or unused in the body
-        && pat_is_wild(cx, &index.kind, closure_body)
+        && let Some(replacement) = index_replacements(cx, closure_param, closure_body)
     {
         // First, try to trigger the lint with our receiver. This will work when chaining methods:
         // ```
         // iter.enumerate().map(|(_, x)| x)
         // ^^^^^^^^^^^^^^^^ `recv`, a call to `std::iter::Iterator::enumerate`
         // ````
-        if !trigger_lint(cx, recv, closure_param.span, elem.span) {
+        if !trigger_lint(cx, recv, closure_param.span, &replacement) {
             // Otherwise, it may be that we have a binding. Find its initializer:
             // ```
             // let binding = iter.enumerate();
@@ -67,7 +67,7 @@ pub(super) fn check(cx: &LateContext<'_>, call_expr: &Expr<'_>, recv: &Expr<'_>,
             // binding.map(|(_, x)| x)
             // ^^^^^^^ `recv`, not a call to `std::iter::Iterator::enumerate`
             let recv_init_expr = expr_or_init(cx, recv);
-            trigger_lint(cx, recv_init_expr, closure_param.span, elem.span);
+            trigger_lint(cx, recv_init_expr, closure_param.span, &replacement);
 
             // Otherwise, the `Enumerate` probably comes from something that we cannot control.
             // This would for instance happen with:
@@ -78,8 +78,57 @@ pub(super) fn check(cx: &LateContext<'_>, call_expr: &Expr<'_>, recv: &Expr<'_>,
     }
 }
 
+/// Check if the index of the closure is used. Returns [`Suggestion`] for suggestions if it isn't.
+///
+/// # Returns
+/// If the index is unused, returns location(s) at which the suggestion needs to replace uses of the
+/// tuple. If the index is used, returns `None`.
+fn index_replacements<'tcx>(cx: &LateContext<'tcx>, param: &Param<'tcx>, body: &'tcx Body<'tcx>) -> Option<Suggestion> {
+    match param.pat.kind {
+        // If we have a tuple of 2 elements with the first element (the index) is either `_` or unused in the body
+        PatKind::Tuple([index, elem], ..) if pat_is_wild(cx, &index.kind, body) => Some(Suggestion::Tuple(elem.span)),
+        // If the tuple is bound to an identifier
+        PatKind::Binding(_, tup_hir_id, _, _) => {
+            // Log each access to `tuple.1` so that we can suggest replacements.
+            let mut index_uses = Vec::new();
+            let index_is_used = for_each_expr_with_closures(cx, body, |expr| {
+                // If we access a field of our tuple
+                if let ExprKind::Field(tup, field) = expr.kind
+                    && path_to_local_id(tup, tup_hir_id)
+                {
+                    // If we refer to the index directly, it is used.
+                    if field.as_str() == "0" {
+                        Break(true)
+                    } else {
+                        index_uses.push(expr.span);
+                        // Otherwise, do not descend so as to not evaluate our tuple expression.
+                        Continue(Descend::No)
+                    }
+                } else if path_to_local_id(expr, tup_hir_id) {
+                    // If we refer to the tuple as a whole, we use the index.
+                    Break(true)
+                } else {
+                    Continue(Descend::Yes)
+                }
+            })
+            // If we didn't `Break`, this means we haven't found a use of our index.
+            .unwrap_or(false);
+
+            if index_is_used {
+                None
+            } else {
+                Some(Suggestion::Binding(index_uses))
+            }
+        },
+        _ => None,
+    }
+}
+
 /// Trigger the lint with the suggestion.
-fn trigger_lint(cx: &LateContext<'_>, recv: &Expr<'_>, closure_param_span: Span, elem_span: Span) -> bool {
+///
+/// # Returns
+/// If the lint was triggered, returns `true`. Otherwise, returns `false`.
+fn trigger_lint(cx: &LateContext<'_>, recv: &Expr<'_>, closure_param_span: Span, replacement: &Suggestion) -> bool {
     // Check if our `recv` is a call to `std::iter::Iterator::enumerate`.
     if let ExprKind::MethodCall(_, enumerate_recv, _, enumerate_span) = recv.kind
         && let Some(enumerate_defid) = cx.typeck_results().type_dependent_def_id(recv.hir_id)
@@ -96,18 +145,47 @@ fn trigger_lint(cx: &LateContext<'_>, recv: &Expr<'_>, closure_param_span: Span,
                 multispan_sugg(
                     diag,
                     "remove the `.enumerate()` call",
-                    vec![
-                        (closure_param_span, snippet(cx, elem_span, "..").into_owned()),
-                        (
-                            enumerate_span.with_lo(enumerate_recv.span.source_callsite().hi()),
-                            String::new(),
-                        ),
-                    ],
+                    std::iter::once((
+                        enumerate_span.with_lo(enumerate_recv.span.source_callsite().hi()),
+                        String::new(),
+                    ))
+                    .chain(replacement.to_suggestion_iter(cx, closure_param_span)),
                 );
             },
         );
         true
     } else {
         false
+    }
+}
+
+/// A replacement to be made in the suggestion for the lint.
+enum Suggestion {
+    /// The closure argument is bound as a tuple `|(_, x)|`. We need only replace it to `|x|`.
+    Tuple(Span),
+    /// The closure argument is bound as a binding `|t|`.
+    ///
+    /// In this case, we need to track every use of `t.1` and replace it to just `t`. We must not
+    /// change the closure parameter span but every use in the body.
+    Binding(Vec<Span>),
+}
+
+impl Suggestion {
+    /// Create an iterator of suggestions for [`multispan_sugg`].
+    fn to_suggestion_iter(
+        &self,
+        cx: &LateContext<'_>,
+        closure_param_span: Span,
+    ) -> Box<dyn Iterator<Item = (Span, String)> + '_> {
+        match self {
+            Suggestion::Tuple(elem_span) => Box::new(std::iter::once((
+                closure_param_span,
+                snippet(cx, *elem_span, "..").into_owned(),
+            ))),
+            Suggestion::Binding(use_spans) => {
+                let param_str = snippet(cx, closure_param_span, "..");
+                Box::new(use_spans.iter().map(move |span| (*span, param_str.to_string())))
+            },
+        }
     }
 }

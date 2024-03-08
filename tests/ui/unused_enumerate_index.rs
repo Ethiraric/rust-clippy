@@ -1,4 +1,4 @@
-#![allow(unused)]
+#![allow(unused, clippy::map_identity)]
 #![warn(clippy::unused_enumerate_index)]
 
 use std::iter::Enumerate;
@@ -84,4 +84,28 @@ fn main() {
         };
     }
     _ = mac2!().enumerate().map(|(_, _v)| {});
+
+    [1].iter().enumerate().map(|x| x.1);
+    [1].iter().enumerate().map(|x| {
+        if *x.1 == 0 {
+            x.1 + 3
+        } else {
+            println!("{}", x.1);
+            *x.1
+        }
+    });
+
+    // This shouldn't trigger the lint. `x` might be used later to access the index.
+    [1].iter().enumerate().map(|x| x);
+    // This shouldn't trigger the lint. `x` is used.
+    [1].iter().enumerate().map(|x| println!("{x:?}"));
+    // This shouldn't trigger the lint. `x.0` is used.
+    [1].iter().enumerate().map(|x| {
+        if x.0 == 0 {
+            x.1 + 3
+        } else {
+            println!("{}", x.1);
+            *x.1
+        }
+    });
 }
